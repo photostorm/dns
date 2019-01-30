@@ -3,12 +3,15 @@
 package dns
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"github.com/Freeaqingme/go-proxyproto"
 	"io"
+	"io/ioutil"
 	"net"
 	"strings"
 	"sync"
@@ -59,6 +62,8 @@ type ResponseWriter interface {
 	LocalAddr() net.Addr
 	// RemoteAddr returns the net.Addr of the client that sent the current request.
 	RemoteAddr() net.Addr
+	// ClientIP returns the net.Addr of the client connecting the PROXY load balancer
+	ClientIP() net.Addr
 	// WriteMsg writes a reply back to the client.
 	WriteMsg(*Msg) error
 	// Write writes a raw buffer back to the client.
@@ -93,6 +98,7 @@ type response struct {
 	udpSession     *SessionUDP       // oob data to get egress interface right
 	writer         Writer            // writer to output the raw DNS bits
 	wg             *sync.WaitGroup   // for gracefull shutdown
+	clientIP       net.Addr
 }
 
 // HandleFailed returns a HandlerFunc that returns SERVFAIL for every request it gets.
@@ -150,10 +156,10 @@ type Writer interface {
 type Reader interface {
 	// ReadTCP reads a raw message from a TCP connection. Implementations may alter
 	// connection properties, for example the read-deadline.
-	ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error)
+	ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, net.Addr, error)
 	// ReadUDP reads a raw message from a UDP connection. Implementations may alter
 	// connection properties, for example the read-deadline.
-	ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *SessionUDP, error)
+	ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, net.Addr, *SessionUDP, error)
 }
 
 // defaultReader is an adapter for the Server struct that implements the Reader interface
@@ -162,11 +168,11 @@ type defaultReader struct {
 	*Server
 }
 
-func (dr defaultReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
+func (dr defaultReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, net.Addr, error) {
 	return dr.readTCP(conn, timeout)
 }
 
-func (dr defaultReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *SessionUDP, error) {
+func (dr defaultReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, net.Addr, *SessionUDP, error) {
 	return dr.readUDP(conn, timeout)
 }
 
@@ -531,7 +537,7 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 	rtimeout := srv.getReadTimeout()
 	// deadline is not used here
 	for srv.isStarted() {
-		m, s, err := reader.ReadUDP(l, rtimeout)
+		m, p, s, err := reader.ReadUDP(l, rtimeout)
 		if err != nil {
 			if !srv.isStarted() {
 				return nil
@@ -541,6 +547,7 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 			}
 			return err
 		}
+
 		if len(m) < headerSize {
 			if cap(m) == srv.UDPSize {
 				srv.udpPool.Put(m[:srv.UDPSize])
@@ -554,6 +561,7 @@ func (srv *Server) serveUDP(l *net.UDPConn) error {
 			udp:        l,
 			udpSession: s,
 			wg:         &wg,
+			clientIP:   p,
 		})
 	}
 
@@ -606,7 +614,7 @@ func (srv *Server) serve(w *response) {
 
 	for q := 0; (q < limit || limit == -1) && srv.isStarted(); q++ {
 		var err error
-		w.msg, err = reader.ReadTCP(w.tcp, timeout)
+		w.msg, w.clientIP, err = reader.ReadTCP(w.tcp, timeout)
 		if err != nil {
 			// TODO(tmthrgd): handle error
 			break
@@ -687,7 +695,7 @@ func (srv *Server) serveDNS(w *response) {
 	handler.ServeDNS(w, req) // Writes back to the client
 }
 
-func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
+func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, net.Addr, error) {
 	// If we race with ShutdownContext, the read deadline may
 	// have been set in the distant past to unblock the read
 	// below. We must not override it, otherwise we may block
@@ -702,36 +710,51 @@ func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error)
 	n, err := conn.Read(l)
 	if err != nil || n != 2 {
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return nil, ErrShortRead
+		return nil, nil, ErrShortRead
 	}
 	length := binary.BigEndian.Uint16(l)
 	if length == 0 {
-		return nil, ErrShortRead
+		return nil, nil, ErrShortRead
 	}
 	m := make([]byte, int(length))
 	n, err = conn.Read(m[:int(length)])
 	if err != nil || n == 0 {
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return nil, ErrShortRead
+		return nil, nil, ErrShortRead
 	}
 	i := n
 	for i < int(length) {
 		j, err := conn.Read(m[i:int(length)])
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		i += j
 	}
 	n = i
 	m = m[:n]
-	return m, nil
+
+	buf := bufio.NewReader(bytes.NewBuffer(m))
+
+	header, headerErr := proxyproto.Read(buf)
+
+	if headerErr == nil {
+		udpData, udpDataErr := ioutil.ReadAll(buf)
+		if udpDataErr == nil {
+			m = udpData
+			return m, header.RemoteAddr(), nil
+		} else {
+			return m, conn.RemoteAddr(), nil
+		}
+	} else {
+		return m, conn.RemoteAddr(), nil
+	}
 }
 
-func (srv *Server) readUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *SessionUDP, error) {
+func (srv *Server) readUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, net.Addr, *SessionUDP, error) {
 	srv.lock.RLock()
 	if srv.started {
 		// See the comment in readTCP above.
@@ -743,10 +766,25 @@ func (srv *Server) readUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *S
 	n, s, err := ReadFromSessionUDP(conn, m)
 	if err != nil {
 		srv.udpPool.Put(m)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	m = m[:n]
-	return m, s, nil
+
+	buf := bufio.NewReader(bytes.NewBuffer(m))
+
+	header, headerErr := proxyproto.Read(buf)
+
+	if headerErr == nil {
+		tcpData, tcpDataErr := ioutil.ReadAll(buf)
+		if tcpDataErr == nil {
+			m = tcpData
+			return m, header.RemoteAddr(), s, nil
+		} else {
+			return m, conn.RemoteAddr(), s, nil
+		}
+	} else {
+		return m, conn.RemoteAddr(), s, nil
+	}
 }
 
 // WriteMsg implements the ResponseWriter.WriteMsg method.
@@ -824,6 +862,11 @@ func (w *response) RemoteAddr() net.Addr {
 	default:
 		panic("dns: internal error: udpSession and tcp both nil")
 	}
+}
+
+// ClientIP implements the ResponseWriter.ClientIP method.
+func (w *response) ClientIP() net.Addr {
+	return w.clientIP
 }
 
 // TsigStatus implements the ResponseWriter.TsigStatus method.
