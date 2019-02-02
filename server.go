@@ -780,10 +780,10 @@ func (srv *Server) readUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, ne
 			m = tcpData
 			return m, header.RemoteAddr(), s, nil
 		} else {
-			return m, conn.RemoteAddr(), s, nil
+			return m, s.raddr, s, nil
 		}
 	} else {
-		return m, conn.RemoteAddr(), s, nil
+		return m, s.raddr, s, nil
 	}
 }
 
